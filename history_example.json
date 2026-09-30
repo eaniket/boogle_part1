@@ -1,0 +1,8 @@
+{
+  "client_id": "6f1e8f4e-7a2c-4a0b-9f3d-2e5c8b1a4d90",
+  "searches": [
+    { "query": "best tacos", "ts": "2026-09-16T18:04:11.512Z" },
+    { "query": "cheap flights", "ts": "2026-09-16T18:03:02.104Z" },
+	...
+  ]
+}

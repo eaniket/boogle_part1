@@ -1,0 +1,15 @@
+{
+	"clients": [
+		{
+			"client_id": "6f1e8f4e-7a2c-4a0b-9f3d-2e5c8b1a4d90",
+			"first_seen": "2026-09-16T18:02:58.001Z",
+			"last_seen": "2026-09-16T18:04:11.512Z",
+			"latest_ip": "137.110.222.15",
+			"ips": ["137.110.222.15"],
+			"searches": [{ "query": "best tacos", "ts": "2026-09-16T18:04:11.512Z" }]
+		},
+		{
+			"client_id": ...,
+		}	
+	]
+}
