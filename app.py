@@ -1,112 +1,145 @@
+
 import os
 import uuid
 from datetime import timezone
+
 import psycopg
-from flask import Flask, render_template, make_response, request, redirect, jsonify
+from flask import Flask, jsonify, make_response, redirect, render_template, request
 
 app = Flask(__name__)
 
+COOKIE_NAME = "boogle_id"
+COOKIE_MAX_AGE = 60 * 60 * 24 * 30  # 30 days
+
 
 def get_database_connection():
-    """Open a PostgreSQL connection using DATABASE_URL when it is provided."""
-    return psycopg.connect(os.environ.get("DATABASE_URL", "postgresql:///boogle"))
+    """Open a PostgreSQL connection."""
+    return psycopg.connect(
+        os.environ.get("DATABASE_URL", "postgresql:///boogle")
+    )
+
 
 def format_timestamp(ts):
-    """Format a PostgreSQL timestamp as UTC ISO 8601 with milliseconds."""
+    """Format a timestamp as UTC ISO 8601 with milliseconds."""
     if ts.tzinfo is None:
         ts = ts.replace(tzinfo=timezone.utc)
     else:
         ts = ts.astimezone(timezone.utc)
 
-    return ts.isoformat(timespec='milliseconds').replace('+00:00', 'Z')
+    return ts.isoformat(timespec="milliseconds").replace("+00:00", "Z")
 
 
-@app.get('/')
-def index():
-    response = make_response(render_template('boogle.html'))
-    cookie_key = 'boogle_id'
-    if cookie_key not in request.cookies:
-        response.set_cookie(
-            key=cookie_key,
-            value=str(uuid.uuid4()),
-            max_age=3600*24*30,  # Set the cookie to expire in 30 days
-            path='/',
-            samesite='Lax',
-            secure=False
-        )
+def get_client_id():
+    """Reuse a valid browser UUID or generate a new one."""
+    cookie_value = request.cookies.get(COOKIE_NAME)
+
+    try:
+        if cookie_value:
+            return uuid.UUID(cookie_value)
+    except (ValueError, TypeError, AttributeError):
+        pass
+
+    return uuid.uuid4()
+
+
+def save_client(client_id):
+    """Ensure the client exists in PostgreSQL."""
+    with get_database_connection() as connection:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                """
+                INSERT INTO clients (client_id)
+                VALUES (%s)
+                ON CONFLICT (client_id)
+                DO UPDATE SET last_seen = now()
+                """,
+                (client_id,),
+            )
+
+
+def set_client_cookie(response, client_id):
+    """Set the persistent browser identity cookie."""
+    response.set_cookie(
+        key=COOKIE_NAME,
+        value=str(client_id),
+        max_age=COOKIE_MAX_AGE,
+        path="/",
+        samesite="Lax",
+        secure=False,
+    )
     return response
 
-@app.get('/search')
+
+@app.get("/")
+def index():
+    client_id = get_client_id()
+    save_client(client_id)
+
+    response = make_response(render_template("boogle.html"))
+    return set_client_cookie(response, client_id)
+
+
+@app.get("/search")
 def search():
-    query = request.args.get('q', '').strip()
+    # Do not strip or otherwise modify the user's query.
+    query = request.args.get("q")
 
-    if query:
-        client_id = request.cookies.get('boogle_id')
-        try:
-            client_id = uuid.UUID(client_id) if client_id else uuid.uuid4()
-        except ValueError:
-            client_id = uuid.uuid4()
+    if query is None or query == "":
+        return redirect("/", code=303)
 
-        with get_database_connection() as connection:
-            with connection.cursor() as cursor:
-                cursor.execute(
-                    """
-                    INSERT INTO clients (client_id)
-                    VALUES (%s)
-                    ON CONFLICT (client_id)
-                    DO UPDATE SET last_seen = now()
-                    """,
-                    (client_id,),
-                )
-                cursor.execute(
-                    """
-                    INSERT INTO requests (client_id, ip, referer, path)
-                    VALUES (%s, %s, %s, %s)
-                    RETURNING request_id
-                    """,
-                    (client_id, request.remote_addr, request.referrer, request.path),
-                )
-                request_id = cursor.fetchone()[0]
-                cursor.execute(
-                    """
-                    INSERT INTO searches (client_id, request_id, query)
-                    VALUES (%s, %s, %s)
-                    """,
-                    (client_id, request_id, query),
-                )
+    client_id = get_client_id()
 
-        response = redirect('/', code=303)
-        response.set_cookie(
-            key='boogle_id',
-            value=str(client_id),
-            max_age=3600*24*30,
-            path='/',
-            samesite='Lax',
-            secure=False,
-        )
-        return response
+    with get_database_connection() as connection:
+        with connection.cursor() as cursor:
+            # Ensure the cookie's UUID exists in the clients table.
+            cursor.execute(
+                """
+                INSERT INTO clients (client_id)
+                VALUES (%s)
+                ON CONFLICT (client_id)
+                DO UPDATE SET last_seen = now()
+                """,
+                (client_id,),
+            )
 
-    return redirect('/', code=303)
+            cursor.execute(
+                """
+                INSERT INTO requests (client_id, ip, referer, path)
+                VALUES (%s, %s, %s, %s)
+                RETURNING request_id
+                """,
+                (
+                    client_id,
+                    request.remote_addr,
+                    request.referrer,
+                    request.path,
+                ),
+            )
+            request_id = cursor.fetchone()[0]
+
+            cursor.execute(
+                """
+                INSERT INTO searches (client_id, request_id, query)
+                VALUES (%s, %s, %s)
+                """,
+                (client_id, request_id, query),
+            )
+
+    response = redirect("/", code=303)
+    return set_client_cookie(response, client_id)
 
 
-@app.get('/api/history')
+@app.get("/api/history")
 def api_history():
-    cookie_value = request.cookies.get('boogle_id')
+    cookie_value = request.cookies.get(COOKIE_NAME)
 
-    # No cookie means a new client with no history.
     if not cookie_value:
-        return jsonify({
-            "client_id": None,
-            "searches": []
-        })
+        return jsonify({"client_id": None, "searches": []})
 
     try:
         client_id = uuid.UUID(cookie_value)
-    except (ValueError, AttributeError):
-        return jsonify({
-            "client_id": None,
-            "searches": []
-        })
+    except (ValueError, TypeError, AttributeError):
+        return jsonify({"client_id": None, "searches": []})
 
     with get_database_connection() as connection:
         with connection.cursor() as cursor:
@@ -119,105 +152,112 @@ def api_history():
                 """,
                 (client_id,),
             )
-
             rows = cursor.fetchall()
 
     searches = [
         {
-            "query": row[0],
-            "ts": row[1].isoformat(timespec='milliseconds').replace('+00:00', 'Z')
-                if row[1].tzinfo is not None
-                else row[1].isoformat(timespec='milliseconds') + 'Z'
+            "query": query,
+            "ts": format_timestamp(ts),
         }
-        for row in rows
+        for query, ts in rows
     ]
 
-    return jsonify({
-        "client_id": str(client_id),
-        "searches": searches
-    })
+    return jsonify(
+        {
+            "client_id": str(client_id),
+            "searches": searches,
+        }
+    )
 
 
-@app.get('/dump')
+@app.get("/dump")
 def dump():
     with get_database_connection() as connection:
         with connection.cursor() as cursor:
-            # Retrieve every client, including clients with no searches.
-            cursor.execute("""
+            # Include every client, even if it has no searches.
+            cursor.execute(
+                """
                 SELECT client_id, first_seen, last_seen
                 FROM clients
                 ORDER BY client_id
-            """)
+                """
+            )
             client_rows = cursor.fetchall()
 
-            # Retrieve requests, newest first for each client.
-            cursor.execute("""
+            # Newest requests first within each client.
+            cursor.execute(
+                """
                 SELECT client_id, ip, ts, request_id
                 FROM requests
                 ORDER BY client_id, ts DESC, request_id DESC
-            """)
+                """
+            )
             request_rows = cursor.fetchall()
 
-            # Retrieve all searches, newest first for each client.
-            cursor.execute("""
+            # Newest searches first within each client.
+            cursor.execute(
+                """
                 SELECT client_id, query, ts, search_id
                 FROM searches
                 ORDER BY client_id, ts DESC, search_id DESC
-            """)
+                """
+            )
             search_rows = cursor.fetchall()
 
-    # Build request history for each client.
     requests_by_client = {}
 
     for client_id, ip, ts, request_id in request_rows:
         entry = requests_by_client.setdefault(
             client_id,
-            {"latest_ip": None, "ips": []}
+            {"latest_ip": None, "ips": []},
         )
 
         if ip is not None:
             ip_string = str(ip)
 
-            # The first non-null IP encountered is the latest known IP.
             if entry["latest_ip"] is None:
                 entry["latest_ip"] = ip_string
 
-            # Preserve order from newest to oldest and remove duplicates.
             if ip_string not in entry["ips"]:
                 entry["ips"].append(ip_string)
 
-    # Build search history for each client.
     searches_by_client = {}
 
     for client_id, query, ts, search_id in search_rows:
-        searches_by_client.setdefault(client_id, []).append({
-            "query": query,
-            "ts": format_timestamp(ts)
-        })
+        searches_by_client.setdefault(client_id, []).append(
+            {
+                # Preserve the query exactly as stored.
+                "query": query,
+                "ts": format_timestamp(ts),
+            }
+        )
 
-    # Assemble the final response.
     clients = []
 
     for client_id, first_seen, last_seen in client_rows:
         request_info = requests_by_client.get(
             client_id,
-            {"latest_ip": None, "ips": []}
+            {"latest_ip": None, "ips": []},
         )
 
-        clients.append({
-            "client_id": str(client_id),
-            "first_seen": format_timestamp(first_seen),
-            "last_seen": format_timestamp(last_seen),
-            "latest_ip": request_info["latest_ip"],
-            "ips": request_info["ips"],
-            "searches": searches_by_client.get(client_id, [])
-        })
+        clients.append(
+            {
+                "client_id": str(client_id),
+                "first_seen": format_timestamp(first_seen),
+                "last_seen": format_timestamp(last_seen),
+                "latest_ip": request_info["latest_ip"],
+                "ips": request_info["ips"],
+                "searches": searches_by_client.get(client_id, []),
+            }
+        )
 
     return jsonify({"clients": clients})
 
-@app.get('/jsontest')
+
+@app.get("/jsontest")
 def jsontest():
-    return {"data" : "I am in CSE190/CSE291!"}
+    return {"data": "I am in CSE190/CSE291!"}
+
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port="8000")
+    app.run(host="0.0.0.0", port=8000)
