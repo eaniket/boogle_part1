@@ -84,7 +84,7 @@ def search():
     # Do not strip or otherwise modify the user's query.
     query = request.args.get("q")
 
-    if query is None or query == "":
+    if query is None or query.strip() == "":
         return redirect("/", code=303)
 
     client_id = get_client_id()
