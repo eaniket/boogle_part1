@@ -1,0 +1,24 @@
+{
+  "id": "6c1f0e0a9d6b4f51",
+  "cur": "USD",
+  "seatbid": [
+    {
+      "seat": "steady",
+      "bid": [
+        {
+          "id": "b-1d2c3e4f5a6b7c8d",
+          "impid": "1",
+          "price": 1.84,
+          "adm": "<div data-boogle-ad data-dsp=\"steady\" data-crid=\"cr-9f8e7d6c5b\" data-bid=\"b-1d2c3e4f5a6b7c8d\" style=\"width:300px;height:250px;background:#1a73e8\"><a href=\"https://brightdeals-1a2b.example/\" target=\"_blank\" rel=\"noopener\">Fresh deals, every day</a></div>",
+          "adomain": ["brightdeals-1a2b.example"],
+          "crid": "cr-9f8e7d6c5b",
+          "attr": [],
+          "w": 300,
+          "h": 250,
+          "mtype": 1,
+          "burl": "<RTB_URL>/bill/b-1d2c3e4f5a6b7c8d?price=${AUCTION_PRICE}"
+        }
+      ]
+    }
+  ]
+}

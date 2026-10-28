@@ -1,0 +1,28 @@
+{
+  "id": "6c1f0e0a9d6b4f51",
+  "imp": [
+    {
+      "id": "1",
+      "tagid": "boogle-top",
+      "banner": {"format": [{"w": 300, "h": 250}]},
+      "bidfloor": 0.50
+    }
+  ],
+  "device": {
+    "ua": "Mozilla/5.0 (iPhone; CPU iPhone OS 17_5 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.5 Mobile/15E148 Safari/604.1",
+    "ip": "137.110.222.15"
+  },
+  "user": {
+    "id": "3f2b8c1e-5a47-4d9e-9b6a-2c0d7e8f1a93",
+    "data": [
+      {
+        "id": "boogle",
+        "name": "boogle-inferred",
+        "segment": [{"id": "206"}, {"id": "901"}],
+        "ext": {"segtax": 500}
+      }
+    ]
+  },
+  "tmax": 250,
+  "badv": ["some-advertiser.example"]
+}
