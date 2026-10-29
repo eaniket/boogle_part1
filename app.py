@@ -35,6 +35,8 @@ RTB_BASE_URL = os.environ.get(
 DSP_NAMES = ("steady", "niche", "shady", "glitch")
 BID_FLOOR = 0.10
 AUCTION_TIMEOUT_MS = 250
+BILL_TIMEOUT_SECONDS = 2.0
+COMPLAINT_BLOCK_THRESHOLD = 10
 IMPRESSION_ID = "1"
 AD_WIDTH = 300
 AD_HEIGHT = 250
@@ -110,6 +112,94 @@ def set_client_cookie(response, client_id):
         secure=False,
     )
     return response
+
+
+def ensure_rtb_tables():
+    """Create durable auction and feedback tables when the app starts."""
+    with get_database_connection() as connection:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                """
+                CREATE TABLE IF NOT EXISTS auctions (
+                    auction_id TEXT PRIMARY KEY,
+                    winning_domain TEXT,
+                    winning_dsp TEXT,
+                    bid_price DOUBLE PRECISION,
+                    final_price DOUBLE PRECISION,
+                    billing_status TEXT NOT NULL,
+                    billing_detail TEXT,
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+                    billed_at TIMESTAMPTZ
+                )
+                """
+            )
+            cursor.execute(
+                """
+                CREATE TABLE IF NOT EXISTS auction_feedback (
+                    feedback_id BIGSERIAL PRIMARY KEY,
+                    auction_id TEXT NOT NULL REFERENCES auctions(auction_id),
+                    event TEXT NOT NULL,
+                    ts TIMESTAMPTZ NOT NULL DEFAULT now(),
+                    UNIQUE (auction_id, event)
+                )
+                """
+            )
+
+
+def complained_domains():
+    """Block only the most complained-about domain after repeated complaints."""
+    try:
+        ensure_rtb_tables()
+        with get_database_connection() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    """
+                    SELECT winning_domain
+                    FROM auctions
+                    JOIN auction_feedback USING (auction_id)
+                    WHERE event = 'complaint' AND winning_domain IS NOT NULL
+                    GROUP BY winning_domain
+                    HAVING COUNT(*) >= %s
+                    ORDER BY COUNT(*) DESC
+                    LIMIT 1
+                    """,
+                    (COMPLAINT_BLOCK_THRESHOLD,),
+                )
+                return [row[0] for row in cursor.fetchall()]
+    except (psycopg.Error, OSError):
+        return []
+
+
+def save_auction(auction_id, winner, final_price, billing_status, detail):
+    """Persist the auction before and after its billing callback."""
+    domains = winner.get("adomain") or []
+    domain = domains[0] if isinstance(domains, list) and domains else None
+    with get_database_connection() as connection:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                """
+                INSERT INTO auctions (
+                    auction_id, winning_domain, winning_dsp, bid_price,
+                    final_price, billing_status, billing_detail, billed_at
+                )
+                VALUES (%s, %s, %s, %s, %s, %s, %s,
+                        CASE WHEN %s = 'success' THEN now() ELSE NULL END)
+                ON CONFLICT (auction_id) DO UPDATE SET
+                    billing_status = EXCLUDED.billing_status,
+                    billing_detail = EXCLUDED.billing_detail,
+                    billed_at = EXCLUDED.billed_at
+                """,
+                (
+                    auction_id,
+                    domain,
+                    winner.get("_dsp"),
+                    winner["price"],
+                    final_price,
+                    billing_status,
+                    detail,
+                    billing_status,
+                ),
+            )
 
 
 @app.get("/")
@@ -429,10 +519,24 @@ def infer_segment_ids(client_id, searches):
         }
         vectorizer, models = load_part3_model()
         visitor_features = vectorizer.transform([user_document(visitor_row)])
-        prediction = {
-            target: model.predict(visitor_features)[0]
-            for target, model in models.items()
-        }
+        if not searches:
+            return []
+        prediction = {}
+        for target, model in models.items():
+            scores = np.asarray(model.decision_function(visitor_features)).ravel()
+            if scores.size == 0:
+                continue
+            if len(model.classes_) == 2 and scores.size == 1:
+                margin = abs(scores[0])
+                value = model.classes_[1 if scores[0] >= 0 else 0]
+            else:
+                order = np.argsort(scores)
+                margin = scores[order[-1]]
+                if scores.size > 1:
+                    margin -= scores[order[-2]]
+                value = model.classes_[order[-1]]
+            if margin >= 0.5:
+                prediction[target] = value
     except (OSError, KeyError, TypeError, ValueError, json.JSONDecodeError):
         return []
 
@@ -441,15 +545,16 @@ def infer_segment_ids(client_id, searches):
     return [
         segment_id
         for attribute, value in prediction.items()
-        if attribute != "client_id"
+        if attribute == "parental_status" and value == "parent"
         for segment_id in [segment_by_value.get((attribute, value))]
         if segment_id is not None
     ]
 
 
-def build_bid_request(client_id, segment_ids):
+def build_bid_request(client_id, segment_ids, auction_id=None, badv=None):
+    auction_id = auction_id or uuid.uuid4().hex
     return {
-        "id": uuid.uuid4().hex,
+        "id": auction_id,
         "imp": [
             {
                 "id": IMPRESSION_ID,
@@ -474,7 +579,7 @@ def build_bid_request(client_id, segment_ids):
             ],
         },
         "tmax": AUCTION_TIMEOUT_MS,
-        "badv": [],
+        "badv": badv or [],
     }
 
 
@@ -510,7 +615,10 @@ def request_dsp_bid(dsp_name, bid_request, deadline):
         payload = json.loads(body)
     except (json.JSONDecodeError, UnicodeDecodeError, TypeError):
         return None
-    return payload if isinstance(payload, dict) else None
+    if not isinstance(payload, dict) or payload.get("id") != bid_request["id"]:
+        return None
+    payload["_dsp"] = dsp_name
+    return payload
 
 
 def request_all_bids(bid_request, deadline):
@@ -567,7 +675,9 @@ def extract_valid_bids(responses):
                     or not isinstance(bid.get("burl"), str)
                 ):
                     continue
-                valid_bids.append(bid)
+                bid_copy = dict(bid)
+                bid_copy["_dsp"] = response.get("_dsp")
+                valid_bids.append(bid_copy)
     return valid_bids
 
 
@@ -586,10 +696,56 @@ def bill_winner(winner, final_price):
         "${AUCTION_PRICE}", format(final_price, ".12g")
     )
     try:
-        with urlopen(billing_url, timeout=AUCTION_TIMEOUT_MS / 1000):
-            pass
-    except (HTTPError, URLError, TimeoutError, OSError, ValueError):
-        pass
+        with urlopen(billing_url, timeout=BILL_TIMEOUT_SECONDS) as response:
+            status = getattr(response, "status", 200)
+        if 200 <= status < 300:
+            return True, str(status)
+        return False, f"http_status:{status}"
+    except HTTPError as exc:
+        return False, f"http_status:{exc.code}"
+    except (URLError, TimeoutError, OSError, ValueError) as exc:
+        return False, type(exc).__name__
+
+
+@app.post("/ad/feedback")
+def ad_feedback():
+    payload = request.get_json(silent=True)
+    if not isinstance(payload, dict):
+        return jsonify({"error": "JSON object required"}), 400
+    auction_id = payload.get("auction_id")
+    event = payload.get("event")
+    if (
+        not isinstance(auction_id, str)
+        or not auction_id.strip()
+        or event != "complaint"
+    ):
+        return jsonify({"error": "valid auction_id and complaint event required"}), 400
+
+    try:
+        ensure_rtb_tables()
+        with get_database_connection() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    """
+                    INSERT INTO auction_feedback (auction_id, event)
+                    SELECT auction_id, %s
+                    FROM auctions
+                    WHERE auction_id = %s
+                    ON CONFLICT (auction_id, event) DO NOTHING
+                    RETURNING feedback_id
+                    """,
+                    (event, auction_id),
+                )
+                if cursor.fetchone() is None:
+                    cursor.execute(
+                        "SELECT 1 FROM auctions WHERE auction_id = %s",
+                        (auction_id,),
+                    )
+                    if cursor.fetchone() is None:
+                        return jsonify({"error": "unknown auction_id"}), 404
+    except (psycopg.Error, OSError):
+        return jsonify({"error": "feedback storage unavailable"}), 503
+    return "", 204
 
 
 @app.get("/ad")
@@ -605,8 +761,14 @@ def ad():
     except (psycopg.Error, OSError):
         searches = []
 
+    auction_id = uuid.uuid4().hex
     segment_ids = infer_segment_ids(client_id, searches)
-    bid_request = build_bid_request(client_id, segment_ids)
+    bid_request = build_bid_request(
+        client_id,
+        segment_ids,
+        auction_id=auction_id,
+        badv=complained_domains(),
+    )
     deadline = time.monotonic() + AUCTION_TIMEOUT_MS / 1000
     responses = request_all_bids(bid_request, deadline)
     print(f"Received responses from DSPs: {responses}")
@@ -615,7 +777,27 @@ def ad():
     if winner is None:
         return "", 200
 
-    bill_winner(winner, final_price)
+    try:
+        ensure_rtb_tables()
+        save_auction(
+            auction_id, winner, final_price, "pending", "not_attempted"
+        )
+    except (psycopg.Error, OSError):
+        return "", 503
+
+    billing_ok, billing_detail = bill_winner(winner, final_price)
+    try:
+        save_auction(
+            auction_id,
+            winner,
+            final_price,
+            "success" if billing_ok else "failed",
+            billing_detail,
+        )
+    except (psycopg.Error, OSError):
+        return "", 503
+    if not billing_ok:
+        return "", 200
     return make_response(winner["adm"], 200, {"Content-Type": "text/html; charset=utf-8"})
 
 
