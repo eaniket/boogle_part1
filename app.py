@@ -35,8 +35,6 @@ RTB_BASE_URL = os.environ.get(
 DSP_NAMES = ("steady", "niche", "shady", "glitch")
 BID_FLOOR = 0.10
 AUCTION_TIMEOUT_MS = 250
-BILL_TIMEOUT_SECONDS = 2.0
-COMPLAINT_BLOCK_THRESHOLD = 10
 IMPRESSION_ID = "1"
 AD_WIDTH = 300
 AD_HEIGHT = 250
@@ -112,94 +110,6 @@ def set_client_cookie(response, client_id):
         secure=False,
     )
     return response
-
-
-def ensure_rtb_tables():
-    """Create the durable auction records used by billing and feedback."""
-    with get_database_connection() as connection:
-        with connection.cursor() as cursor:
-            cursor.execute(
-                """
-                CREATE TABLE IF NOT EXISTS auctions (
-                    auction_id TEXT PRIMARY KEY,
-                    winning_domain TEXT,
-                    winning_dsp TEXT,
-                    bid_price DOUBLE PRECISION,
-                    final_price DOUBLE PRECISION,
-                    billing_status TEXT NOT NULL,
-                    billing_detail TEXT,
-                    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-                    billed_at TIMESTAMPTZ
-                )
-                """
-            )
-            cursor.execute(
-                """
-                CREATE TABLE IF NOT EXISTS auction_feedback (
-                    feedback_id BIGSERIAL PRIMARY KEY,
-                    auction_id TEXT NOT NULL REFERENCES auctions(auction_id),
-                    event TEXT NOT NULL,
-                    ts TIMESTAMPTZ NOT NULL DEFAULT now(),
-                    UNIQUE (auction_id, event)
-                )
-                """
-            )
-
-
-def complained_domains():
-    """Return domains with repeated complaints, without blocking all inventory."""
-    try:
-        ensure_rtb_tables()
-        with get_database_connection() as connection:
-            with connection.cursor() as cursor:
-                cursor.execute(
-                    """
-                    SELECT winning_domain
-                    FROM auctions
-                    JOIN auction_feedback USING (auction_id)
-                    WHERE event = 'complaint' AND winning_domain IS NOT NULL
-                    GROUP BY winning_domain
-                    HAVING COUNT(*) >= %s
-                    ORDER BY COUNT(*) DESC
-                    LIMIT 1
-                    """,
-                    (COMPLAINT_BLOCK_THRESHOLD,),
-                )
-                return [row[0] for row in cursor.fetchall()]
-    except (psycopg.Error, OSError):
-        return []
-
-
-def save_auction(auction_id, winner, final_price, billing_status, detail):
-    """Record the winner and billing result before an ad is returned."""
-    domains = winner.get("adomain") or []
-    domain = domains[0] if isinstance(domains, list) and domains else None
-    with get_database_connection() as connection:
-        with connection.cursor() as cursor:
-            cursor.execute(
-                """
-                INSERT INTO auctions (
-                    auction_id, winning_domain, winning_dsp, bid_price,
-                    final_price, billing_status, billing_detail, billed_at
-                )
-                VALUES (%s, %s, %s, %s, %s, %s, %s,
-                        CASE WHEN %s = 'success' THEN now() ELSE NULL END)
-                ON CONFLICT (auction_id) DO UPDATE SET
-                    billing_status = EXCLUDED.billing_status,
-                    billing_detail = EXCLUDED.billing_detail,
-                    billed_at = EXCLUDED.billed_at
-                """,
-                (
-                    auction_id,
-                    domain,
-                    winner.get("_dsp"),
-                    winner["price"],
-                    final_price,
-                    billing_status,
-                    detail,
-                    billing_status,
-                ),
-            )
 
 
 @app.get("/")
@@ -519,44 +429,27 @@ def infer_segment_ids(client_id, searches):
         }
         vectorizer, models = load_part3_model()
         visitor_features = vectorizer.transform([user_document(visitor_row)])
-        if not searches:
-            return []
-        prediction = {}
-        for target, model in models.items():
-            scores = np.asarray(model.decision_function(visitor_features)).ravel()
-            if scores.size == 0:
-                continue
-            if len(model.classes_) == 2 and scores.size == 1:
-                margin = abs(scores[0])
-                value = model.classes_[1 if scores[0] >= 0 else 0]
-            else:
-                order = np.argsort(scores)
-                margin = scores[order[-1]]
-                if scores.size > 1:
-                    margin -= scores[order[-2]]
-                value = model.classes_[order[-1]]
-            if margin < 0.5:
-                continue
-            prediction[target] = value
+        prediction = {
+            target: model.predict(visitor_features)[0]
+            for target, model in models.items()
+        }
     except (OSError, KeyError, TypeError, ValueError, json.JSONDecodeError):
         return []
 
     # The taxonomy lookup omits any model value that cannot be represented and
     # guarantees no more than one segment for each demographic attribute.
-    segments = [
+    return [
         segment_id
         for attribute, value in prediction.items()
-        if attribute == "parental_status" and value == "parent"
+        if attribute != "client_id"
         for segment_id in [segment_by_value.get((attribute, value))]
         if segment_id is not None
     ]
-    return segments
 
 
-def build_bid_request(client_id, segment_ids, auction_id=None, badv=None):
-    auction_id = auction_id or uuid.uuid4().hex
+def build_bid_request(client_id, segment_ids):
     return {
-        "id": auction_id,
+        "id": uuid.uuid4().hex,
         "imp": [
             {
                 "id": IMPRESSION_ID,
@@ -581,100 +474,8 @@ def build_bid_request(client_id, segment_ids, auction_id=None, badv=None):
             ],
         },
         "tmax": AUCTION_TIMEOUT_MS,
-        "badv": get_blocked_advertiser_domains(),
+        "badv": [],
     }
-
-
-def ensure_ad_auction_tables():
-    """Create the small amount of persistent state required for ad feedback."""
-    with get_database_connection() as connection:
-        with connection.cursor() as cursor:
-            cursor.execute(
-                """
-                CREATE TABLE IF NOT EXISTS ad_auctions (
-                    auction_id TEXT PRIMARY KEY,
-                    advertiser_domains JSONB NOT NULL DEFAULT '[]'::jsonb,
-                    dsp_name TEXT,
-                    bid_price DOUBLE PRECISION,
-                    final_price DOUBLE PRECISION,
-                    billing_success BOOLEAN NOT NULL DEFAULT FALSE,
-                    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
-                )
-                """
-            )
-            cursor.execute(
-                """
-                ALTER TABLE ad_auctions
-                ADD COLUMN IF NOT EXISTS billing_success BOOLEAN NOT NULL DEFAULT FALSE
-                """
-            )
-            cursor.execute(
-                """
-                CREATE TABLE IF NOT EXISTS ad_feedback (
-                    feedback_id BIGSERIAL PRIMARY KEY,
-                    auction_id TEXT NOT NULL REFERENCES ad_auctions(auction_id),
-                    event TEXT NOT NULL,
-                    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-                    UNIQUE (auction_id, event)
-                )
-                """
-            )
-
-
-def get_blocked_advertiser_domains():
-    """Return domains associated with at least one recorded complaint."""
-    ensure_ad_auction_tables()
-    with get_database_connection() as connection:
-        with connection.cursor() as cursor:
-            cursor.execute(
-                """
-                SELECT DISTINCT lower(domain)
-                FROM ad_auctions AS a
-                JOIN ad_feedback AS f ON f.auction_id = a.auction_id
-                CROSS JOIN LATERAL jsonb_array_elements_text(
-                    a.advertiser_domains
-                ) AS domains(domain)
-                WHERE f.event = 'complaint'
-                ORDER BY lower(domain)
-                """
-            )
-            return [row[0] for row in cursor.fetchall()]
-
-
-def save_auction(bid_request, winner, final_price, billing_success):
-    """Persist the winner so later complaints can be tied to its advertiser."""
-    domains = winner.get("adomain", [])
-    if isinstance(domains, str):
-        domains = [domains]
-    if not isinstance(domains, list):
-        domains = []
-    domains = sorted({
-        domain.strip().lower()
-        for domain in domains
-        if isinstance(domain, str) and domain.strip()
-    })
-
-    ensure_ad_auction_tables()
-    with get_database_connection() as connection:
-        with connection.cursor() as cursor:
-            cursor.execute(
-                """
-                INSERT INTO ad_auctions (
-                    auction_id, advertiser_domains, dsp_name,
-                    bid_price, final_price, billing_success
-                )
-                VALUES (%s, %s::jsonb, %s, %s, %s, %s)
-                ON CONFLICT (auction_id) DO NOTHING
-                """,
-                (
-                    bid_request["id"],
-                    json.dumps(domains),
-                    winner.get("_boogle_dsp_name"),
-                    winner["price"],
-                    final_price,
-                    billing_success,
-                ),
-            )
 
 
 def request_dsp_bid(dsp_name, bid_request, deadline):
@@ -709,10 +510,7 @@ def request_dsp_bid(dsp_name, bid_request, deadline):
         payload = json.loads(body)
     except (json.JSONDecodeError, UnicodeDecodeError, TypeError):
         return None
-    if not isinstance(payload, dict):
-        return None
-    payload["_boogle_dsp_name"] = dsp_name
-    return payload
+    return payload if isinstance(payload, dict) else None
 
 
 def request_all_bids(bid_request, deadline):
@@ -769,11 +567,7 @@ def extract_valid_bids(responses):
                     or not isinstance(bid.get("burl"), str)
                 ):
                     continue
-                bid_with_source = dict(bid)
-                bid_with_source["_boogle_dsp_name"] = response.get(
-                    "_boogle_dsp_name"
-                )
-                valid_bids.append(bid_with_source)
+                valid_bids.append(bid)
     return valid_bids
 
 
@@ -792,50 +586,10 @@ def bill_winner(winner, final_price):
         "${AUCTION_PRICE}", format(final_price, ".12g")
     )
     try:
-        with urlopen(billing_url, timeout=AUCTION_TIMEOUT_MS / 1000) as response:
-            return 200 <= response.status < 300
+        with urlopen(billing_url, timeout=AUCTION_TIMEOUT_MS / 1000):
+            pass
     except (HTTPError, URLError, TimeoutError, OSError, ValueError):
-        return False
-
-
-@app.post("/ad/feedback")
-def ad_feedback():
-    """Record an auction complaint and use it to block the advertiser later."""
-    payload = request.get_json(silent=True)
-    if not isinstance(payload, dict):
-        return jsonify({"error": "Expected JSON body"}), 400
-
-    auction_id = payload.get("auction_id")
-    event = payload.get("event")
-    if not isinstance(auction_id, str) or not auction_id.strip():
-        return jsonify({"error": "Missing auction_id"}), 400
-    if event != "complaint":
-        return jsonify({"error": "Unsupported event"}), 400
-
-    try:
-        ensure_ad_auction_tables()
-        with get_database_connection() as connection:
-            with connection.cursor() as cursor:
-                cursor.execute(
-                    "SELECT 1 FROM ad_auctions WHERE auction_id = %s",
-                    (auction_id,),
-                )
-                if cursor.fetchone() is None:
-                    return jsonify({"error": "Unknown auction_id"}), 404
-
-                cursor.execute(
-                    """
-                    INSERT INTO ad_feedback (auction_id, event)
-                    VALUES (%s, %s)
-                    ON CONFLICT (auction_id, event) DO NOTHING
-                    """,
-                    (auction_id, event),
-                )
-    except (psycopg.Error, OSError):
-        app.logger.exception("Failed to record ad feedback")
-        return jsonify({"error": "Could not record feedback"}), 500
-
-    return jsonify({"status": "recorded"}), 200
+        pass
 
 
 @app.get("/ad")
@@ -851,14 +605,8 @@ def ad():
     except (psycopg.Error, OSError):
         searches = []
 
-    auction_id = uuid.uuid4().hex
     segment_ids = infer_segment_ids(client_id, searches)
-    bid_request = build_bid_request(
-        client_id,
-        segment_ids,
-        auction_id=auction_id,
-        badv=complained_domains(),
-    )
+    bid_request = build_bid_request(client_id, segment_ids)
     deadline = time.monotonic() + AUCTION_TIMEOUT_MS / 1000
     responses = request_all_bids(bid_request, deadline)
     print(f"Received responses from DSPs: {responses}")
@@ -867,17 +615,8 @@ def ad():
     if winner is None:
         return "", 200
 
-    billing_success = bill_winner(winner, final_price)
-    try:
-        save_auction(bid_request, winner, final_price, billing_success)
-    except (psycopg.Error, OSError):
-        app.logger.exception("Failed to persist auction %s", bid_request["id"])
-
-    return make_response(
-        winner["adm"],
-        200,
-        {"Content-Type": "text/html; charset=utf-8"},
-    )
+    bill_winner(winner, final_price)
+    return make_response(winner["adm"], 200, {"Content-Type": "text/html; charset=utf-8"})
 
 
 if __name__ == "__main__":
