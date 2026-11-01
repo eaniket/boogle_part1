@@ -36,8 +36,8 @@ RTB_BASE_URL = os.environ.get(
 DSP_NAMES = ("steady", "niche", "shady", "glitch")
 BID_FLOOR = 0.10
 AUCTION_TIMEOUT_MS = 250
-BILL_TIMEOUT_SECONDS = 2.0
-COMPLAINT_THRESHOLD = 3
+BILL_TIMEOUT_SECONDS = 5.0
+COMPLAINT_THRESHOLD = 10
 IMPRESSION_ID = "1"
 AD_WIDTH = 300
 AD_HEIGHT = 250
@@ -630,7 +630,11 @@ def ad_feedback():
         if domain:
             COMPLAINT_COUNTS[domain] = COMPLAINT_COUNTS.get(domain, 0) + 1
             if COMPLAINT_COUNTS[domain] >= COMPLAINT_THRESHOLD:
-                BLOCKED_DOMAINS.add(domain)
+                worst_domain = max(
+                    COMPLAINT_COUNTS, key=COMPLAINT_COUNTS.get
+                )
+                BLOCKED_DOMAINS.clear()
+                BLOCKED_DOMAINS.add(worst_domain)
     return "", 204
 
 
