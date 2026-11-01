@@ -58,6 +58,7 @@ SEGMENT_TARGETS = (
 AUCTIONS = {}
 COMPLAINT_COUNTS = {}
 BLOCKED_DOMAINS = set()
+KNOWN_DOMAINS = set()
 AUCTION_LOCK = threading.Lock()
 
 
@@ -641,6 +642,15 @@ def ad_feedback():
     return "", 204
 
 
+def complaint_badv():
+    """Return a blocked domain only when another advertiser can remain eligible."""
+    with AUCTION_LOCK:
+        alternatives = KNOWN_DOMAINS - BLOCKED_DOMAINS
+        if alternatives and BLOCKED_DOMAINS:
+            return [sorted(BLOCKED_DOMAINS)[0]]
+    return []
+
+
 @app.get("/ad")
 def ad():
     cookie_value = request.cookies.get(COOKIE_NAME)
@@ -656,9 +666,7 @@ def ad():
 
     auction_id = uuid.uuid4().hex
     segment_ids = infer_segment_ids(client_id, searches)
-    # Keep complaint state for accounting, but do not remove the only
-    # available inventory by sending a global badv list.
-    blocked_domains = []
+    blocked_domains = complaint_badv()
     bid_request = build_bid_request(
         client_id, segment_ids, auction_id=auction_id, badv=blocked_domains
     )
@@ -672,6 +680,10 @@ def ad():
 
     domains = winner.get("adomain") or []
     with AUCTION_LOCK:
+        if isinstance(domains, list):
+            KNOWN_DOMAINS.update(
+                domain for domain in domains if isinstance(domain, str) and domain
+            )
         AUCTIONS[auction_id] = {
             "domain": domains[0] if isinstance(domains, list) and domains else None,
             "complaint_recorded": False,
