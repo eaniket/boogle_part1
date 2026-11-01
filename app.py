@@ -532,7 +532,13 @@ def request_all_bids(bid_request, deadline):
         executor.submit(request_dsp_bid, dsp_name, bid_request, deadline)
         for dsp_name in DSP_NAMES
     ]
-    done, pending = wait(futures, timeout=max(0, deadline - time.monotonic()))
+    # Keep waiting for workers to finish, but request_dsp_bid applies the
+    # OpenRTB deadline and discards any response that arrives after tmax.
+    done, pending = wait(
+        futures,
+        timeout=max(0, deadline - time.monotonic())
+        + DSP_RESPONSE_WAIT_MS / 1000,
+    )
     for future in pending:
         future.cancel()
     # Do not wait for a timed-out network call while leaving the request.  Each
@@ -671,7 +677,7 @@ def ad():
     bid_request = build_bid_request(
         client_id, segment_ids, auction_id=auction_id, badv=blocked_domains
     )
-    deadline = time.monotonic() + DSP_RESPONSE_WAIT_MS / 1000
+    deadline = time.monotonic() + AUCTION_TIMEOUT_MS / 1000
     responses = request_all_bids(bid_request, deadline)
     print(f"Received responses from DSPs: {responses}")
     winner, final_price = choose_winner_and_price(extract_valid_bids(responses))
