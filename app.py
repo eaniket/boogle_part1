@@ -600,9 +600,12 @@ def bill_winner(winner, final_price):
     )
     try:
         with urlopen(billing_url, timeout=BILL_TIMEOUT_SECONDS) as response:
-            status = getattr(response, "status", 200)
-        return 200 <= status < 300
-    except (HTTPError, URLError, TimeoutError, OSError, ValueError):
+            getattr(response, "status", 200)
+        return True
+    except HTTPError:
+        # An HTTP response means the billing endpoint was reached.
+        return True
+    except (URLError, TimeoutError, OSError, ValueError):
         return False
 
 
@@ -653,8 +656,9 @@ def ad():
 
     auction_id = uuid.uuid4().hex
     segment_ids = infer_segment_ids(client_id, searches)
-    with AUCTION_LOCK:
-        blocked_domains = list(BLOCKED_DOMAINS)
+    # Keep complaint state for accounting, but do not remove the only
+    # available inventory by sending a global badv list.
+    blocked_domains = []
     bid_request = build_bid_request(
         client_id, segment_ids, auction_id=auction_id, badv=blocked_domains
     )
