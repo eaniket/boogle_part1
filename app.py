@@ -33,7 +33,8 @@ RTB_BASE_URL = os.environ.get(
 #     "RTB_BASE_URL", "http://localhost:9000"
 # ).rstrip("/")
 DSP_NAMES = ("steady", "niche", "shady", "glitch")
-BID_FLOOR = 0.10
+# Match the Part 4 OpenRTB configuration and avoid underpriced lone bids.
+BID_FLOOR = 0.50
 AUCTION_TIMEOUT_MS = 250
 BILL_TIMEOUT_SECONDS = 2.0
 COMPLAINT_BLOCK_THRESHOLD = 10
@@ -545,7 +546,10 @@ def infer_segment_ids(client_id, searches):
     return [
         segment_id
         for attribute, value in prediction.items()
-        if attribute == "parental_status" and value == "parent"
+        if not (
+            (attribute == "age" and value == "65+")
+            or (attribute == "household_income" and value == "top_10")
+        )
         for segment_id in [segment_by_value.get((attribute, value))]
         if segment_id is not None
     ]
