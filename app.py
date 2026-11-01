@@ -4,6 +4,7 @@ import json
 import math
 import os
 import re
+import threading
 import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor, wait
@@ -35,6 +36,8 @@ RTB_BASE_URL = os.environ.get(
 DSP_NAMES = ("steady", "niche", "shady", "glitch")
 BID_FLOOR = 0.10
 AUCTION_TIMEOUT_MS = 250
+BILL_TIMEOUT_SECONDS = 2.0
+COMPLAINT_THRESHOLD = 3
 IMPRESSION_ID = "1"
 AD_WIDTH = 300
 AD_HEIGHT = 250
@@ -52,6 +55,10 @@ SEGMENT_TARGETS = (
     "home_ownership",
     "parental_status",
 )
+AUCTIONS = {}
+COMPLAINT_COUNTS = {}
+BLOCKED_DOMAINS = set()
+AUCTION_LOCK = threading.Lock()
 
 
 def get_database_connection():
@@ -447,9 +454,10 @@ def infer_segment_ids(client_id, searches):
     ]
 
 
-def build_bid_request(client_id, segment_ids):
+def build_bid_request(client_id, segment_ids, auction_id=None, badv=None):
+    auction_id = auction_id or uuid.uuid4().hex
     return {
-        "id": uuid.uuid4().hex,
+        "id": auction_id,
         "imp": [
             {
                 "id": IMPRESSION_ID,
@@ -474,7 +482,7 @@ def build_bid_request(client_id, segment_ids):
             ],
         },
         "tmax": AUCTION_TIMEOUT_MS,
-        "badv": [],
+        "badv": badv or [],
     }
 
 
@@ -510,7 +518,10 @@ def request_dsp_bid(dsp_name, bid_request, deadline):
         payload = json.loads(body)
     except (json.JSONDecodeError, UnicodeDecodeError, TypeError):
         return None
-    return payload if isinstance(payload, dict) else None
+    if not isinstance(payload, dict) or payload.get("id") != bid_request["id"]:
+        return None
+    payload["_dsp"] = dsp_name
+    return payload
 
 
 def request_all_bids(bid_request, deadline):
@@ -567,7 +578,9 @@ def extract_valid_bids(responses):
                     or not isinstance(bid.get("burl"), str)
                 ):
                     continue
-                valid_bids.append(bid)
+                bid_copy = dict(bid)
+                bid_copy["_dsp"] = response.get("_dsp")
+                valid_bids.append(bid_copy)
     return valid_bids
 
 
@@ -586,10 +599,39 @@ def bill_winner(winner, final_price):
         "${AUCTION_PRICE}", format(final_price, ".12g")
     )
     try:
-        with urlopen(billing_url, timeout=AUCTION_TIMEOUT_MS / 1000):
-            pass
+        with urlopen(billing_url, timeout=BILL_TIMEOUT_SECONDS) as response:
+            status = getattr(response, "status", 200)
+        return 200 <= status < 300
     except (HTTPError, URLError, TimeoutError, OSError, ValueError):
-        pass
+        return False
+
+
+@app.post("/ad/feedback")
+def ad_feedback():
+    payload = request.get_json(silent=True)
+    if not isinstance(payload, dict):
+        return jsonify({"error": "JSON object required"}), 400
+    auction_id = payload.get("auction_id")
+    if (
+        not isinstance(auction_id, str)
+        or not auction_id
+        or payload.get("event") != "complaint"
+    ):
+        return jsonify({"error": "invalid complaint"}), 400
+
+    with AUCTION_LOCK:
+        auction = AUCTIONS.get(auction_id)
+        if auction is None:
+            return jsonify({"error": "unknown auction_id"}), 404
+        if auction["complaint_recorded"]:
+            return "", 204
+        auction["complaint_recorded"] = True
+        domain = auction.get("domain")
+        if domain:
+            COMPLAINT_COUNTS[domain] = COMPLAINT_COUNTS.get(domain, 0) + 1
+            if COMPLAINT_COUNTS[domain] >= COMPLAINT_THRESHOLD:
+                BLOCKED_DOMAINS.add(domain)
+    return "", 204
 
 
 @app.get("/ad")
@@ -605,8 +647,13 @@ def ad():
     except (psycopg.Error, OSError):
         searches = []
 
+    auction_id = uuid.uuid4().hex
     segment_ids = infer_segment_ids(client_id, searches)
-    bid_request = build_bid_request(client_id, segment_ids)
+    with AUCTION_LOCK:
+        blocked_domains = list(BLOCKED_DOMAINS)
+    bid_request = build_bid_request(
+        client_id, segment_ids, auction_id=auction_id, badv=blocked_domains
+    )
     deadline = time.monotonic() + AUCTION_TIMEOUT_MS / 1000
     responses = request_all_bids(bid_request, deadline)
     print(f"Received responses from DSPs: {responses}")
@@ -615,7 +662,17 @@ def ad():
     if winner is None:
         return "", 200
 
-    bill_winner(winner, final_price)
+    domains = winner.get("adomain") or []
+    with AUCTION_LOCK:
+        AUCTIONS[auction_id] = {
+            "domain": domains[0] if isinstance(domains, list) and domains else None,
+            "complaint_recorded": False,
+            "billed": False,
+        }
+    if not bill_winner(winner, final_price):
+        return "", 200
+    with AUCTION_LOCK:
+        AUCTIONS[auction_id]["billed"] = True
     return make_response(winner["adm"], 200, {"Content-Type": "text/html; charset=utf-8"})
 
 
