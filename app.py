@@ -36,6 +36,7 @@ RTB_BASE_URL = os.environ.get(
 DSP_NAMES = ("steady", "niche", "shady", "glitch")
 BID_FLOOR = 0.10
 AUCTION_TIMEOUT_MS = 250
+DSP_RESPONSE_WAIT_MS = 5000
 BILL_TIMEOUT_SECONDS = 5.0
 COMPLAINT_THRESHOLD = 10
 IMPRESSION_ID = "1"
@@ -670,7 +671,7 @@ def ad():
     bid_request = build_bid_request(
         client_id, segment_ids, auction_id=auction_id, badv=blocked_domains
     )
-    deadline = time.monotonic() + AUCTION_TIMEOUT_MS / 1000
+    deadline = time.monotonic() + DSP_RESPONSE_WAIT_MS / 1000
     responses = request_all_bids(bid_request, deadline)
     print(f"Received responses from DSPs: {responses}")
     winner, final_price = choose_winner_and_price(extract_valid_bids(responses))
