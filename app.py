@@ -39,6 +39,7 @@ AUCTION_TIMEOUT_MS = 250
 DSP_RESPONSE_WAIT_MS = 5000
 BILL_TIMEOUT_SECONDS = 5.0
 COMPLAINT_THRESHOLD = 10
+SEGMENT_CONFIDENCE_MARGIN = 0.5
 IMPRESSION_ID = "1"
 AD_WIDTH = 300
 AD_HEIGHT = 250
@@ -438,10 +439,22 @@ def infer_segment_ids(client_id, searches):
         }
         vectorizer, models = load_part3_model()
         visitor_features = vectorizer.transform([user_document(visitor_row)])
-        prediction = {
-            target: model.predict(visitor_features)[0]
-            for target, model in models.items()
-        }
+        prediction = {}
+        for target, model in models.items():
+            scores = np.asarray(model.decision_function(visitor_features)).ravel()
+            if not scores.size:
+                continue
+            if len(model.classes_) == 2 and scores.size == 1:
+                margin = abs(scores[0])
+                value = model.classes_[1 if scores[0] >= 0 else 0]
+            else:
+                order = np.argsort(scores)
+                margin = scores[order[-1]]
+                if scores.size > 1:
+                    margin -= scores[order[-2]]
+                value = model.classes_[order[-1]]
+            if margin >= SEGMENT_CONFIDENCE_MARGIN:
+                prediction[target] = value
     except (OSError, KeyError, TypeError, ValueError, json.JSONDecodeError):
         return []
 
@@ -608,11 +621,10 @@ def bill_winner(winner, final_price):
     )
     try:
         with urlopen(billing_url, timeout=BILL_TIMEOUT_SECONDS) as response:
-            getattr(response, "status", 200)
-        return True
-    except HTTPError:
-        # An HTTP response means the billing endpoint was reached.
-        return True
+            status = getattr(response, "status", 200)
+        return 200 <= status < 300
+    except HTTPError as exc:
+        return 200 <= exc.code < 300
     except (URLError, TimeoutError, OSError, ValueError):
         return False
 
