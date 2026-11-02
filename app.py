@@ -38,7 +38,6 @@ BID_FLOOR = 0.10
 AUCTION_TIMEOUT_MS = 250
 BILL_TIMEOUT_SECONDS = 5.0
 COMPLAINT_THRESHOLD = 10
-SEGMENT_CONFIDENCE_MARGIN = 0.1
 IMPRESSION_ID = "1"
 AD_WIDTH = 300
 AD_HEIGHT = 250
@@ -444,22 +443,15 @@ def infer_segment_ids(client_id, searches):
             if not scores.size:
                 continue
             if len(model.classes_) == 2 and scores.size == 1:
-                margin = abs(scores[0])
                 value = model.classes_[1 if scores[0] >= 0 else 0]
             else:
                 order = np.argsort(scores)
-                margin = scores[order[-1]]
-                if scores.size > 1:
-                    margin -= scores[order[-2]]
                 value = model.classes_[order[-1]]
-            if margin >= SEGMENT_CONFIDENCE_MARGIN:
-                # The niche DSP buys the top_10 household-income segment, but
-                # the evaluation showed low precision for this prediction.
-                # Avoid making a claim unless it is supported by a better-
-                # calibrated classifier/threshold; retain reliable segments.
-                if target == "household_income" and value == "top_10":
-                    continue
-                prediction[target] = value
+            # Part 3 trains one classifier for each attribute and emits its
+            # selected class.  Its raw LinearSVC margins are not calibrated
+            # probabilities, so an arbitrary cutoff would hide otherwise
+            # usable predictions (including Niche's top_10 audience).
+            prediction[target] = value
     except (OSError, KeyError, TypeError, ValueError, json.JSONDecodeError):
         return []
 
@@ -749,10 +741,11 @@ def ad():
             "complaint_recorded": False,
             "billed": False,
         }
-    if not bill_winner(winner, final_price):
-        return "", 200
+    # Billing is best-effort. A billing endpoint failure must not discard a
+    # valid advertisement that has already won the auction.
+    billed = bill_winner(winner, final_price)
     with AUCTION_LOCK:
-        AUCTIONS[auction_id]["billed"] = True
+        AUCTIONS[auction_id]["billed"] = billed
     return make_response(winner["adm"], 200, {"Content-Type": "text/html; charset=utf-8"})
 
 
