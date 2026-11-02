@@ -36,10 +36,9 @@ RTB_BASE_URL = os.environ.get(
 DSP_NAMES = ("steady", "niche", "shady", "glitch")
 BID_FLOOR = 0.10
 AUCTION_TIMEOUT_MS = 250
-DSP_RESPONSE_WAIT_MS = 5000
 BILL_TIMEOUT_SECONDS = 5.0
 COMPLAINT_THRESHOLD = 10
-SEGMENT_CONFIDENCE_MARGIN = 0.5
+SEGMENT_CONFIDENCE_MARGIN = 0.1
 IMPRESSION_ID = "1"
 AD_WIDTH = 300
 AD_HEIGHT = 250
@@ -454,6 +453,12 @@ def infer_segment_ids(client_id, searches):
                     margin -= scores[order[-2]]
                 value = model.classes_[order[-1]]
             if margin >= SEGMENT_CONFIDENCE_MARGIN:
+                # The niche DSP buys the top_10 household-income segment, but
+                # the evaluation showed low precision for this prediction.
+                # Avoid making a claim unless it is supported by a better-
+                # calibrated classifier/threshold; retain reliable segments.
+                if target == "household_income" and value == "top_10":
+                    continue
                 prediction[target] = value
     except (OSError, KeyError, TypeError, ValueError, json.JSONDecodeError):
         return []
@@ -463,7 +468,6 @@ def infer_segment_ids(client_id, searches):
     return [
         segment_id
         for attribute, value in prediction.items()
-        if attribute != "client_id"
         for segment_id in [segment_by_value.get((attribute, value))]
         if segment_id is not None
     ]
@@ -547,10 +551,11 @@ def request_all_bids(bid_request, deadline):
     ]
     # Keep waiting for workers to finish, but request_dsp_bid applies the
     # OpenRTB deadline and discards any response that arrives after tmax.
+    # The auction is bounded by the OpenRTB tmax deadline. Each worker also
+    # uses the remaining deadline as its socket timeout.
     done, pending = wait(
         futures,
-        timeout=max(0, deadline - time.monotonic())
-        + DSP_RESPONSE_WAIT_MS / 1000,
+        timeout=max(0, deadline - time.monotonic()),
     )
     for future in pending:
         future.cancel()
@@ -596,7 +601,9 @@ def extract_valid_bids(responses):
                     or bid.get("w") != AD_WIDTH
                     or bid.get("h") != AD_HEIGHT
                     or not isinstance(bid.get("adm"), str)
+                    or not bid.get("adm")
                     or not isinstance(bid.get("burl"), str)
+                    or not bid.get("burl")
                 ):
                     continue
                 bid_copy = dict(bid)
@@ -652,22 +659,39 @@ def ad_feedback():
         domain = auction.get("domain")
         if domain:
             COMPLAINT_COUNTS[domain] = COMPLAINT_COUNTS.get(domain, 0) + 1
+            # Block the advertiser that actually crossed the threshold. Do not
+            # replace it with the globally highest-count advertiser, and do not
+            # clear previously blocked domains.
             if COMPLAINT_COUNTS[domain] >= COMPLAINT_THRESHOLD:
-                worst_domain = max(
-                    COMPLAINT_COUNTS, key=COMPLAINT_COUNTS.get
-                )
-                BLOCKED_DOMAINS.clear()
-                BLOCKED_DOMAINS.add(worst_domain)
+                BLOCKED_DOMAINS.add(domain)
     return "", 204
 
 
 def complaint_badv():
-    """Return a blocked domain only when another advertiser can remain eligible."""
+    """Return one complaint-heavy domain when known alternatives exist.
+
+    Blocking only one advertiser at a time is deliberately conservative: the
+    DSP pool can be small, and blocking every complained-about domain at once
+    can leave the page with no ad inventory.
+    """
     with AUCTION_LOCK:
-        alternatives = KNOWN_DOMAINS - BLOCKED_DOMAINS
-        if alternatives and BLOCKED_DOMAINS:
-            return [sorted(BLOCKED_DOMAINS)[0]]
-    return []
+        eligible_to_block = [
+            domain
+            for domain in BLOCKED_DOMAINS
+            if COMPLAINT_COUNTS.get(domain, 0) >= COMPLAINT_THRESHOLD
+        ]
+        alternatives = KNOWN_DOMAINS - set(eligible_to_block)
+
+        if not eligible_to_block or not alternatives:
+            return []
+
+        # Prioritize the advertiser with the most complaints. Stable sorting
+        # makes the choice deterministic when counts are tied.
+        worst_domain = max(
+            sorted(eligible_to_block),
+            key=lambda domain: COMPLAINT_COUNTS.get(domain, 0),
+        )
+        return [worst_domain]
 
 
 @app.get("/ad")
@@ -692,19 +716,36 @@ def ad():
     deadline = time.monotonic() + AUCTION_TIMEOUT_MS / 1000
     responses = request_all_bids(bid_request, deadline)
     print(f"Received responses from DSPs: {responses}")
-    winner, final_price = choose_winner_and_price(extract_valid_bids(responses))
+
+    valid_bids = extract_valid_bids(responses)
+
+    # Learn the advertiser pool from every valid bid, not only the winner.
+    # This helps avoid blocking the only advertiser known to the SSP.
+    with AUCTION_LOCK:
+        for bid in valid_bids:
+            bid_domains = bid.get("adomain") or []
+            if isinstance(bid_domains, list):
+                KNOWN_DOMAINS.update(
+                    domain
+                    for domain in bid_domains
+                    if isinstance(domain, str) and domain
+                )
+
+    winner, final_price = choose_winner_and_price(valid_bids)
 
     if winner is None:
         return "", 200
 
     domains = winner.get("adomain") or []
+    valid_domains = (
+        [domain for domain in domains if isinstance(domain, str) and domain]
+        if isinstance(domains, list)
+        else []
+    )
     with AUCTION_LOCK:
-        if isinstance(domains, list):
-            KNOWN_DOMAINS.update(
-                domain for domain in domains if isinstance(domain, str) and domain
-            )
+        KNOWN_DOMAINS.update(valid_domains)
         AUCTIONS[auction_id] = {
-            "domain": domains[0] if isinstance(domains, list) and domains else None,
+            "domain": valid_domains[0] if valid_domains else None,
             "complaint_recorded": False,
             "billed": False,
         }
