@@ -604,6 +604,27 @@ def extract_valid_bids(responses):
     return valid_bids
 
 
+def _bid_domains(bid):
+    domains = bid.get("adomain")
+    if not isinstance(domains, list):
+        return []
+    return [domain for domain in domains if isinstance(domain, str) and domain]
+
+
+def _valid_bids(responses, blocked_domains=None, blocked_creatives=None):
+    blocked_domains = set(blocked_domains or [])
+    blocked_creatives = set(blocked_creatives or [])
+    return [
+        bid
+        for bid in extract_valid_bids(responses)
+        if not blocked_domains.intersection(_bid_domains(bid))
+        and (
+            not bid.get("crid")
+            or bid.get("crid") not in blocked_creatives
+        )
+    ]
+
+
 def choose_winner_and_price(valid_bids):
     if not valid_bids:
         return None, None
@@ -612,13 +633,69 @@ def choose_winner_and_price(valid_bids):
         key=lambda bid: (
             -bid["price"],
             bid.get("_dsp") or "",
-            (bid_adomains(bid) or [""])[0],
+            (bid.get("adomain") or [""])[0],
         ),
     )
     winner = ranked[0]
     reference_price = ranked[1]["price"] if len(ranked) > 1 else BID_FLOOR
     final_price = min(winner["price"], max(reference_price, BID_FLOOR) + 0.01)
     return winner, final_price
+
+
+def _remember_winner(auction_id, client_id, winner):
+    domains = _bid_domains(winner)
+    try:
+        with get_database_connection() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    """
+                    INSERT INTO auction_winners
+                        (auction_id, client_id, crid, adomain_json)
+                    VALUES (%s, %s, %s, %s::jsonb)
+                    ON CONFLICT (auction_id) DO NOTHING
+                    """,
+                    (
+                        auction_id,
+                        client_id,
+                        winner.get("crid"),
+                        json.dumps(domains),
+                    ),
+                )
+    except psycopg.Error as exc:
+        print(f"Could not persist auction {auction_id}: {exc}")
+
+
+def _complained_domains_and_creatives():
+    blocked_domains = set()
+    blocked_creatives = set()
+    try:
+        with get_database_connection() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    """
+                    SELECT domain
+                    FROM complained_advertisers
+                    WHERE complaint_count >= %s
+                    """,
+                    (COMPLAINT_THRESHOLD,),
+                )
+                blocked_domains.update(row[0] for row in cursor.fetchall())
+                cursor.execute(
+                    """
+                    SELECT crid
+                    FROM complained_creatives
+                    WHERE complaint_count >= %s
+                    """,
+                    (COMPLAINT_THRESHOLD,),
+                )
+                blocked_creatives.update(row[0] for row in cursor.fetchall())
+    except psycopg.Error as exc:
+        print(f"Could not load complaint exclusions: {exc}")
+
+    # Keep the local state useful for the supplied standalone tests and for
+    # complaints received before the persistent tables were added.
+    blocked_domains.update(complaint_badv())
+    return sorted(blocked_domains), sorted(blocked_creatives)
 
 
 def bill_winner(winner, final_price):
@@ -635,79 +712,118 @@ def bill_winner(winner, final_price):
         return False
 
 
+def _validate_feedback(payload):
+    return (
+        isinstance(payload, dict)
+        and isinstance(payload.get("auction_id"), str)
+        and bool(payload["auction_id"].strip())
+        and payload.get("event") == "complaint"
+    )
+
+
+def _increment_complaint_count(cursor, table, column, value):
+    cursor.execute(
+        f"""
+        INSERT INTO {table} ({column}, complaint_count)
+        VALUES (%s, 1)
+        ON CONFLICT ({column})
+        DO UPDATE SET complaint_count =
+            {table}.complaint_count + 1
+        """,
+        (value,),
+    )
+
+
+def _record_complaint(connection, auction_id):
+    with connection.cursor() as cursor:
+        cursor.execute(
+            """
+            SELECT crid, adomain_json
+            FROM auction_winners
+            WHERE auction_id = %s
+            """,
+            (auction_id,),
+        )
+        winner = cursor.fetchone()
+        if winner is None:
+            return False
+
+        cursor.execute(
+            """
+            INSERT INTO complaints (auction_id)
+            VALUES (%s)
+            ON CONFLICT (auction_id) DO NOTHING
+            RETURNING auction_id
+            """,
+            (auction_id,),
+        )
+        if cursor.fetchone() is None:
+            return True
+
+        crid, domains = winner
+        for domain in domains or []:
+            _increment_complaint_count(
+                cursor, "complained_advertisers", "domain", domain
+            )
+        if crid:
+            _increment_complaint_count(
+                cursor, "complained_creatives", "crid", crid
+            )
+        return True
+
+
 @app.post("/ad/feedback")
 def ad_feedback():
     payload = request.get_json(silent=True)
-    if not isinstance(payload, dict):
-        return jsonify({"error": "JSON object required"}), 400
-    auction_id = payload.get("auction_id")
-    if (
-        not isinstance(auction_id, str)
-        or not auction_id
-        or payload.get("event") != "complaint"
-    ):
-        return jsonify({"error": "invalid complaint"}), 400
+    if not _validate_feedback(payload):
+        return jsonify({"error": "Expected auction_id and event='complaint'"}), 400
+
+    auction_id = payload["auction_id"]
+    with get_database_connection() as connection:
+        found = _record_complaint(connection, auction_id)
+        if found:
+            connection.commit()
+
+    if not found:
+        return jsonify({"error": "Unknown auction_id"}), 404
 
     with AUCTION_LOCK:
         auction = AUCTIONS.get(auction_id)
-        if auction is None:
-            return jsonify({"error": "unknown auction_id"}), 404
-        if auction["complaint_recorded"]:
-            return "", 204
-        auction["complaint_recorded"] = True
-        domain = auction.get("domain")
-        if domain:
-            COMPLAINT_COUNTS[domain] = COMPLAINT_COUNTS.get(domain, 0) + 1
-            # Mark the advertiser that actually crossed the threshold. It is
-            # excluded locally, per auction (see
-            # filter_complaint_blocked_bids), never via the global badv
-            # field, and previously blocked domains are not cleared.
-            if COMPLAINT_COUNTS[domain] >= COMPLAINT_THRESHOLD:
-                BLOCKED_DOMAINS.add(domain)
-    return "", 204
+        if auction is not None and not auction["complaint_recorded"]:
+            auction["complaint_recorded"] = True
+            for domain in _bid_domains(auction):
+                COMPLAINT_COUNTS[domain] = COMPLAINT_COUNTS.get(domain, 0) + 1
+                if COMPLAINT_COUNTS[domain] >= COMPLAINT_THRESHOLD:
+                    BLOCKED_DOMAINS.add(domain)
+    return jsonify({"status": "ok"})
 
 
-def bid_adomains(bid):
-    """Return a bid's advertiser domains as a list of strings."""
-    domains = bid.get("adomain")
-    if isinstance(domains, str):
-        return [domains] if domains else []
-    if isinstance(domains, list):
-        return [domain for domain in domains if isinstance(domain, str) and domain]
-    return []
+def complaint_badv():
+    """Return one complaint-heavy domain when known alternatives exist.
 
-
-def filter_complaint_blocked_bids(valid_bids):
-    """Exclude complaint-blocked advertisers from a single auction.
-
-    Blocked domains are deliberately NOT sent in the bid request's badv
-    field. badv is global: the DSPs stop bidding that advertiser for every
-    user, so blocking the highest-volume advertiser (which crosses the
-    absolute complaint threshold first simply because it wins most often)
-    emptied all inventory from the round after the threshold was crossed,
-    even though the only "alternatives" in KNOWN_DOMAINS were historical
-    losing bids that never bid again.
-
-    Instead, the decision is made per auction, against the bids that
-    actually arrived in this auction:
-
-    - If at least one valid bid is from an unblocked advertiser, blocked
-      bids are dropped, so complained ads stop winning and the
-      second-price reference is computed from the remaining bids.
-    - If every valid bid is from a blocked advertiser, the bids are kept
-      as a fallback, so the page still shows an ad rather than going
-      permanently empty when that advertiser is the only live inventory.
+    Blocking only one advertiser at a time is deliberately conservative: the
+    DSP pool can be small, and blocking every complained-about domain at once
+    can leave the page with no ad inventory.
     """
     with AUCTION_LOCK:
-        blocked = set(BLOCKED_DOMAINS)
-    if not blocked or not valid_bids:
-        return valid_bids
-    unblocked = [
-        bid
-        for bid in valid_bids
-        if not blocked.intersection(bid_adomains(bid))
-    ]
-    return unblocked if unblocked else valid_bids
+        eligible_to_block = [
+            domain
+            for domain in BLOCKED_DOMAINS
+            if COMPLAINT_COUNTS.get(domain, COMPLAINT_THRESHOLD)
+            >= COMPLAINT_THRESHOLD
+        ]
+        alternatives = KNOWN_DOMAINS - set(eligible_to_block)
+
+        if not eligible_to_block or not alternatives:
+            return []
+
+        # Prioritize the advertiser with the most complaints. Stable sorting
+        # makes the choice deterministic when counts are tied.
+        worst_domain = max(
+            sorted(eligible_to_block),
+            key=lambda domain: COMPLAINT_COUNTS.get(domain, 0),
+        )
+        return [worst_domain]
 
 
 @app.get("/ad")
@@ -723,44 +839,45 @@ def ad():
     except (psycopg.Error, OSError):
         searches = []
 
-    auction_id = uuid.uuid4().hex
+    auction_id = uuid.uuid4().hex[:16]
     segment_ids = infer_segment_ids(client_id, searches)
-    # Never advertise blocked domains in badv: that blocks the advertiser
-    # globally at every DSP and can empty all inventory. Complaint-blocked
-    # advertisers are excluded locally after bids arrive instead (see
-    # filter_complaint_blocked_bids).
+    blocked_domains, blocked_creatives = _complained_domains_and_creatives()
     bid_request = build_bid_request(
-        client_id, segment_ids, auction_id=auction_id, badv=[]
+        client_id, segment_ids, auction_id=auction_id, badv=blocked_domains
     )
     deadline = time.monotonic() + AUCTION_TIMEOUT_MS / 1000
     responses = request_all_bids(bid_request, deadline)
     print(f"Received responses from DSPs: {responses}")
 
-    valid_bids = extract_valid_bids(responses)
+    valid_bids = _valid_bids(responses, blocked_domains, blocked_creatives)
 
     # Learn the advertiser pool from every valid bid, not only the winner.
+    # This helps avoid blocking the only advertiser known to the SSP.
     with AUCTION_LOCK:
         for bid in valid_bids:
-            KNOWN_DOMAINS.update(bid_adomains(bid))
-
-    # Exclude complaint-blocked advertisers from this auction. If an
-    # unblocked bid exists, blocked bids cannot win; if blocked bids are
-    # the only bids that arrived, they are kept so the slot still fills.
-    valid_bids = filter_complaint_blocked_bids(valid_bids)
+            bid_domains = bid.get("adomain") or []
+            if isinstance(bid_domains, list):
+                KNOWN_DOMAINS.update(
+                    domain
+                    for domain in bid_domains
+                    if isinstance(domain, str) and domain
+                )
 
     winner, final_price = choose_winner_and_price(valid_bids)
 
     if winner is None:
         return "", 200
 
-    valid_domains = bid_adomains(winner)
+    valid_domains = _bid_domains(winner)
     with AUCTION_LOCK:
         KNOWN_DOMAINS.update(valid_domains)
         AUCTIONS[auction_id] = {
-            "domain": valid_domains[0] if valid_domains else None,
+            "adomain": valid_domains,
+            "crid": winner.get("crid"),
             "complaint_recorded": False,
             "billed": False,
         }
+    _remember_winner(auction_id, client_id, winner)
     # Billing is best-effort. A billing endpoint failure must not discard a
     # valid advertisement that has already won the auction.
     billed = bill_winner(winner, final_price)
