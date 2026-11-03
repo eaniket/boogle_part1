@@ -607,7 +607,14 @@ def extract_valid_bids(responses):
 def choose_winner_and_price(valid_bids):
     if not valid_bids:
         return None, None
-    ranked = sorted(valid_bids, key=lambda bid: bid["price"], reverse=True)
+    ranked = sorted(
+        valid_bids,
+        key=lambda bid: (
+            -bid["price"],
+            bid.get("_dsp") or "",
+            (bid.get("adomain") or [""])[0],
+        ),
+    )
     winner = ranked[0]
     reference_price = ranked[1]["price"] if len(ranked) > 1 else BID_FLOOR
     final_price = min(winner["price"], max(reference_price, BID_FLOOR) + 0.01)
