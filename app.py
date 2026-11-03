@@ -612,7 +612,7 @@ def choose_winner_and_price(valid_bids):
         key=lambda bid: (
             -bid["price"],
             bid.get("_dsp") or "",
-            (bid.get("adomain") or [""])[0],
+            (bid_adomains(bid) or [""])[0],
         ),
     )
     winner = ranked[0]
@@ -658,39 +658,56 @@ def ad_feedback():
         domain = auction.get("domain")
         if domain:
             COMPLAINT_COUNTS[domain] = COMPLAINT_COUNTS.get(domain, 0) + 1
-            # Block the advertiser that actually crossed the threshold. Do not
-            # replace it with the globally highest-count advertiser, and do not
-            # clear previously blocked domains.
+            # Mark the advertiser that actually crossed the threshold. It is
+            # excluded locally, per auction (see
+            # filter_complaint_blocked_bids), never via the global badv
+            # field, and previously blocked domains are not cleared.
             if COMPLAINT_COUNTS[domain] >= COMPLAINT_THRESHOLD:
                 BLOCKED_DOMAINS.add(domain)
     return "", 204
 
 
-def complaint_badv():
-    """Return one complaint-heavy domain when known alternatives exist.
+def bid_adomains(bid):
+    """Return a bid's advertiser domains as a list of strings."""
+    domains = bid.get("adomain")
+    if isinstance(domains, str):
+        return [domains] if domains else []
+    if isinstance(domains, list):
+        return [domain for domain in domains if isinstance(domain, str) and domain]
+    return []
 
-    Blocking only one advertiser at a time is deliberately conservative: the
-    DSP pool can be small, and blocking every complained-about domain at once
-    can leave the page with no ad inventory.
+
+def filter_complaint_blocked_bids(valid_bids):
+    """Exclude complaint-blocked advertisers from a single auction.
+
+    Blocked domains are deliberately NOT sent in the bid request's badv
+    field. badv is global: the DSPs stop bidding that advertiser for every
+    user, so blocking the highest-volume advertiser (which crosses the
+    absolute complaint threshold first simply because it wins most often)
+    emptied all inventory from the round after the threshold was crossed,
+    even though the only "alternatives" in KNOWN_DOMAINS were historical
+    losing bids that never bid again.
+
+    Instead, the decision is made per auction, against the bids that
+    actually arrived in this auction:
+
+    - If at least one valid bid is from an unblocked advertiser, blocked
+      bids are dropped, so complained ads stop winning and the
+      second-price reference is computed from the remaining bids.
+    - If every valid bid is from a blocked advertiser, the bids are kept
+      as a fallback, so the page still shows an ad rather than going
+      permanently empty when that advertiser is the only live inventory.
     """
     with AUCTION_LOCK:
-        eligible_to_block = [
-            domain
-            for domain in BLOCKED_DOMAINS
-            if COMPLAINT_COUNTS.get(domain, 0) >= COMPLAINT_THRESHOLD
-        ]
-        alternatives = KNOWN_DOMAINS - set(eligible_to_block)
-
-        if not eligible_to_block or not alternatives:
-            return []
-
-        # Prioritize the advertiser with the most complaints. Stable sorting
-        # makes the choice deterministic when counts are tied.
-        worst_domain = max(
-            sorted(eligible_to_block),
-            key=lambda domain: COMPLAINT_COUNTS.get(domain, 0),
-        )
-        return [worst_domain]
+        blocked = set(BLOCKED_DOMAINS)
+    if not blocked or not valid_bids:
+        return valid_bids
+    unblocked = [
+        bid
+        for bid in valid_bids
+        if not blocked.intersection(bid_adomains(bid))
+    ]
+    return unblocked if unblocked else valid_bids
 
 
 @app.get("/ad")
@@ -708,9 +725,12 @@ def ad():
 
     auction_id = uuid.uuid4().hex
     segment_ids = infer_segment_ids(client_id, searches)
-    blocked_domains = complaint_badv()
+    # Never advertise blocked domains in badv: that blocks the advertiser
+    # globally at every DSP and can empty all inventory. Complaint-blocked
+    # advertisers are excluded locally after bids arrive instead (see
+    # filter_complaint_blocked_bids).
     bid_request = build_bid_request(
-        client_id, segment_ids, auction_id=auction_id, badv=blocked_domains
+        client_id, segment_ids, auction_id=auction_id, badv=[]
     )
     deadline = time.monotonic() + AUCTION_TIMEOUT_MS / 1000
     responses = request_all_bids(bid_request, deadline)
@@ -719,28 +739,21 @@ def ad():
     valid_bids = extract_valid_bids(responses)
 
     # Learn the advertiser pool from every valid bid, not only the winner.
-    # This helps avoid blocking the only advertiser known to the SSP.
     with AUCTION_LOCK:
         for bid in valid_bids:
-            bid_domains = bid.get("adomain") or []
-            if isinstance(bid_domains, list):
-                KNOWN_DOMAINS.update(
-                    domain
-                    for domain in bid_domains
-                    if isinstance(domain, str) and domain
-                )
+            KNOWN_DOMAINS.update(bid_adomains(bid))
+
+    # Exclude complaint-blocked advertisers from this auction. If an
+    # unblocked bid exists, blocked bids cannot win; if blocked bids are
+    # the only bids that arrived, they are kept so the slot still fills.
+    valid_bids = filter_complaint_blocked_bids(valid_bids)
 
     winner, final_price = choose_winner_and_price(valid_bids)
 
     if winner is None:
         return "", 200
 
-    domains = winner.get("adomain") or []
-    valid_domains = (
-        [domain for domain in domains if isinstance(domain, str) and domain]
-        if isinstance(domains, list)
-        else []
-    )
+    valid_domains = bid_adomains(winner)
     with AUCTION_LOCK:
         KNOWN_DOMAINS.update(valid_domains)
         AUCTIONS[auction_id] = {
