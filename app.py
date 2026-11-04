@@ -36,6 +36,7 @@ RTB_BASE_URL = os.environ.get(
 DSP_NAMES = ("steady", "niche", "shady", "glitch")
 BID_FLOOR = 0.10
 AUCTION_TIMEOUT_MS = 1000
+PRICING_TIMEOUT_MS = 250
 BILL_TIMEOUT_SECONDS = 5.0
 COMPLAINT_THRESHOLD = 10
 IMPRESSION_ID = "1"
@@ -562,6 +563,7 @@ def request_dsp_bid(dsp_name, bid_request, deadline):
         )
         return None
     payload["_dsp"] = dsp_name
+    payload["_arrived_at"] = arrived_at
     logger.info(
         "Auction %s accepted response from dsp=%s status=%s body_bytes=%d",
         bid_request["id"],
@@ -820,11 +822,25 @@ def ad():
     bid_request = build_bid_request(
         client_id, segment_ids, auction_id=auction_id, badv=blocked_domains
     )
-    deadline = time.monotonic() + AUCTION_TIMEOUT_MS / 1000
-    responses = request_all_bids(bid_request, deadline)
+    auction_started_at = time.monotonic()
+    collection_deadline = auction_started_at + AUCTION_TIMEOUT_MS / 1000
+    pricing_deadline = auction_started_at + PRICING_TIMEOUT_MS / 1000
+    responses = request_all_bids(bid_request, collection_deadline)
     print(f"Received responses from DSPs: {responses}")
 
-    valid_bids = extract_valid_bids(responses)
+    timely_responses = [
+        response
+        for response in responses
+        if response.get("_arrived_at", auction_started_at) <= pricing_deadline
+    ]
+    logger.info(
+        "Auction %s pricing cutoff: responses=%d timely=%d cutoff_ms=%d",
+        auction_id,
+        len(responses),
+        len(timely_responses),
+        PRICING_TIMEOUT_MS,
+    )
+    valid_bids = extract_valid_bids(timely_responses)
 
     # Learn the advertiser pool from every valid bid, not only the winner.
     # This helps avoid blocking the only advertiser known to the SSP.
