@@ -35,7 +35,7 @@ RTB_BASE_URL = os.environ.get(
 # ).rstrip("/")
 DSP_NAMES = ("steady", "niche", "shady", "glitch")
 BID_FLOOR = 0.10
-AUCTION_TIMEOUT_MS = 250
+AUCTION_TIMEOUT_MS = 750
 BILL_TIMEOUT_SECONDS = 5.0
 COMPLAINT_THRESHOLD = 10
 IMPRESSION_ID = "1"
