@@ -1,3 +1,4 @@
+
 import functools
 import json
 import math
@@ -23,7 +24,6 @@ from sklearn.metrics import f1_score
 from sklearn.svm import LinearSVC
 
 app = Flask(__name__)
-logger = app.logger
 
 COOKIE_NAME = "boogle_id"
 COOKIE_MAX_AGE = 60 * 60 * 24 * 30  # 30 days
@@ -35,8 +35,7 @@ RTB_BASE_URL = os.environ.get(
 # ).rstrip("/")
 DSP_NAMES = ("steady", "niche", "shady", "glitch")
 BID_FLOOR = 0.10
-AUCTION_TIMEOUT_MS = 1000
-PRICING_TIMEOUT_MS = 250
+AUCTION_TIMEOUT_MS = 250
 BILL_TIMEOUT_SECONDS = 5.0
 COMPLAINT_THRESHOLD = 10
 IMPRESSION_ID = "1"
@@ -518,59 +517,21 @@ def request_dsp_bid(dsp_name, bid_request, deadline):
     except HTTPError as exc:
         # urllib represents some non-200 responses as exceptions.  A 204 is a
         # normal no-bid; every other HTTP failure is ignored independently.
-        logger.info(
-            "Auction %s DSP response failed: dsp=%s http_status=%s",
-            bid_request["id"],
-            dsp_name,
-            exc.code,
-        )
         if exc.code == 204:
             return None
         return None
     except (URLError, TimeoutError, OSError, ValueError):
-        logger.info(
-            "Auction %s DSP response failed: dsp=%s reason=network_or_timeout",
-            bid_request["id"],
-            dsp_name,
-        )
         return None
 
     if arrived_at > deadline or status == 204 or status != 200:
-        logger.info(
-            "Auction %s discarded DSP response: dsp=%s status=%s "
-            "arrived_after_deadline=%s",
-            bid_request["id"],
-            dsp_name,
-            status,
-            arrived_at > deadline,
-        )
         return None
     try:
         payload = json.loads(body)
     except (json.JSONDecodeError, UnicodeDecodeError, TypeError):
-        logger.warning(
-            "Auction %s discarded invalid JSON from dsp=%s",
-            bid_request["id"],
-            dsp_name,
-        )
         return None
     if not isinstance(payload, dict) or payload.get("id") != bid_request["id"]:
-        logger.warning(
-            "Auction %s discarded mismatched response from dsp=%s response_id=%s",
-            bid_request["id"],
-            dsp_name,
-            payload.get("id") if isinstance(payload, dict) else None,
-        )
         return None
     payload["_dsp"] = dsp_name
-    payload["_arrived_at"] = arrived_at
-    logger.info(
-        "Auction %s accepted response from dsp=%s status=%s body_bytes=%d",
-        bid_request["id"],
-        dsp_name,
-        status,
-        len(body),
-    )
     return payload
 
 
@@ -595,12 +556,7 @@ def request_all_bids(bid_request, deadline):
     executor.shutdown(wait=False, cancel_futures=True)
 
     responses = []
-    logger.info(
-        "Auction %s DSP collection complete: done=%d pending=%d",
-        bid_request["id"],
-        len(done),
-        len(pending),
-    )
+    print(f"done futures: {len(done)}, pending futures: {len(pending)}")
     for future in done:
         try:
             response = future.result()
@@ -616,18 +572,9 @@ def extract_valid_bids(responses):
     valid_bids = []
     for response in responses:
         if response.get("cur") != "USD":
-            logger.info(
-                "Rejected DSP response: dsp=%s reason=currency currency=%s",
-                response.get("_dsp"),
-                response.get("cur"),
-            )
             continue
         seatbids = response.get("seatbid")
         if not isinstance(seatbids, list):
-            logger.info(
-                "Rejected DSP response: dsp=%s reason=seatbid_type",
-                response.get("_dsp"),
-            )
             continue
 
         for seatbid in seatbids:
@@ -650,35 +597,16 @@ def extract_valid_bids(responses):
                     or not isinstance(bid.get("burl"), str)
                     or not bid.get("burl")
                 ):
-                    logger.info(
-                        "Rejected bid: dsp=%s price=%s impid=%s size=%sx%s "
-                        "has_adm=%s has_burl=%s",
-                        response.get("_dsp"),
-                        price,
-                        bid.get("impid"),
-                        bid.get("w"),
-                        bid.get("h"),
-                        bool(bid.get("adm")),
-                        bool(bid.get("burl")),
-                    )
                     continue
                 bid_copy = dict(bid)
                 bid_copy["_dsp"] = response.get("_dsp")
                 valid_bids.append(bid_copy)
-                logger.info(
-                    "Accepted bid: dsp=%s price=%.4f domain=%s crid=%s",
-                    response.get("_dsp"),
-                    price,
-                    (bid.get("adomain") or [None])[0],
-                    bid.get("crid"),
-                )
     return valid_bids
 
 
 def choose_winner_and_price(valid_bids):
     if not valid_bids:
         return None, None
-
     ranked = sorted(
         valid_bids,
         key=lambda bid: (
@@ -687,56 +615,19 @@ def choose_winner_and_price(valid_bids):
             (bid.get("adomain") or [""])[0],
         ),
     )
-
     winner = ranked[0]
-    reference_price = ranked[1]["price"] if len(ranked) > 1 else None
-
-    second_price = (
-        ranked[1]["price"] if len(ranked) > 1 else BID_FLOOR
-    )
-
-    final_price = min(
-        winner["price"],
-        max(second_price, BID_FLOOR) + 0.01,
-    )
-
-    logger.info(
-        "Auction pricing: candidates=%s winner_price=%.4f "
-        "runner_up_price=%s final_price=%.4f",
-        [
-            {
-                "dsp": bid.get("_dsp"),
-                "price": bid["price"],
-                "domain": (bid.get("adomain") or [None])[0],
-            }
-            for bid in ranked
-        ],
-        winner["price"],
-        reference_price,
-        final_price,
-    )
-
+    reference_price = ranked[1]["price"] if len(ranked) > 1 else BID_FLOOR
+    final_price = min(winner["price"], max(reference_price, BID_FLOOR) + 0.01)
     return winner, final_price
+
 
 def bill_winner(winner, final_price):
     billing_url = winner["burl"].replace(
         "${AUCTION_PRICE}", format(final_price, ".12g")
     )
     try:
-        logger.info(
-            "Billing winner: dsp=%s bid_price=%.4f auction_price=%.4f",
-            winner.get("_dsp"),
-            winner["price"],
-            final_price,
-        )
         with urlopen(billing_url, timeout=BILL_TIMEOUT_SECONDS) as response:
             status = getattr(response, "status", 200)
-        logger.info(
-            "Billing response: dsp=%s auction_price=%.4f status=%s",
-            winner.get("_dsp"),
-            final_price,
-            status,
-        )
         return 200 <= status < 300
     except HTTPError as exc:
         return 200 <= exc.code < 300
@@ -786,8 +677,7 @@ def complaint_badv():
         eligible_to_block = [
             domain
             for domain in BLOCKED_DOMAINS
-            if COMPLAINT_COUNTS.get(domain, COMPLAINT_THRESHOLD)
-            >= COMPLAINT_THRESHOLD
+            if COMPLAINT_COUNTS.get(domain, 0) >= COMPLAINT_THRESHOLD
         ]
         alternatives = KNOWN_DOMAINS - set(eligible_to_block)
 
@@ -822,25 +712,11 @@ def ad():
     bid_request = build_bid_request(
         client_id, segment_ids, auction_id=auction_id, badv=blocked_domains
     )
-    auction_started_at = time.monotonic()
-    collection_deadline = auction_started_at + AUCTION_TIMEOUT_MS / 1000
-    pricing_deadline = auction_started_at + PRICING_TIMEOUT_MS / 1000
-    responses = request_all_bids(bid_request, collection_deadline)
+    deadline = time.monotonic() + AUCTION_TIMEOUT_MS / 1000
+    responses = request_all_bids(bid_request, deadline)
     print(f"Received responses from DSPs: {responses}")
 
-    timely_responses = [
-        response
-        for response in responses
-        if response.get("_arrived_at", auction_started_at) <= pricing_deadline
-    ]
-    logger.info(
-        "Auction %s pricing cutoff: responses=%d timely=%d cutoff_ms=%d",
-        auction_id,
-        len(responses),
-        len(timely_responses),
-        PRICING_TIMEOUT_MS,
-    )
-    valid_bids = extract_valid_bids(timely_responses)
+    valid_bids = extract_valid_bids(responses)
 
     # Learn the advertiser pool from every valid bid, not only the winner.
     # This helps avoid blocking the only advertiser known to the SSP.
@@ -872,16 +748,11 @@ def ad():
             "complaint_recorded": False,
             "billed": False,
         }
+    # Billing is best-effort. A billing endpoint failure must not discard a
+    # valid advertisement that has already won the auction.
     billed = bill_winner(winner, final_price)
     with AUCTION_LOCK:
         AUCTIONS[auction_id]["billed"] = billed
-    if not billed:
-        logger.warning(
-            "Auction %s suppressed because billing failed: dsp=%s",
-            auction_id,
-            winner.get("_dsp"),
-        )
-        return "", 200
     return make_response(winner["adm"], 200, {"Content-Type": "text/html; charset=utf-8"})
 
 
