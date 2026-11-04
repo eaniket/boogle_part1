@@ -676,6 +676,7 @@ def extract_valid_bids(responses):
 def choose_winner_and_price(valid_bids):
     if not valid_bids:
         return None, None
+
     ranked = sorted(
         valid_bids,
         key=lambda bid: (
@@ -684,13 +685,19 @@ def choose_winner_and_price(valid_bids):
             (bid.get("adomain") or [""])[0],
         ),
     )
+
     winner = ranked[0]
     reference_price = ranked[1]["price"] if len(ranked) > 1 else None
-    final_price = (
-        min(winner["price"], max(ranked[1]["price"], BID_FLOOR) + 0.01)
-        if len(ranked) > 1
-        else BID_FLOOR + 0.01
+
+    second_price = (
+        ranked[1]["price"] if len(ranked) > 1 else BID_FLOOR
     )
+
+    final_price = min(
+        winner["price"],
+        max(second_price, BID_FLOOR) + 0.01,
+    )
+
     logger.info(
         "Auction pricing: candidates=%s winner_price=%.4f "
         "runner_up_price=%s final_price=%.4f",
@@ -706,8 +713,8 @@ def choose_winner_and_price(valid_bids):
         reference_price,
         final_price,
     )
-    return winner, final_price
 
+    return winner, final_price
 
 def bill_winner(winner, final_price):
     billing_url = winner["burl"].replace(
