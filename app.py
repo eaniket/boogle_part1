@@ -687,9 +687,9 @@ def choose_winner_and_price(valid_bids):
     winner = ranked[0]
     reference_price = ranked[1]["price"] if len(ranked) > 1 else None
     final_price = (
-        min(winner["price"], ranked[1]["price"])
+        min(winner["price"], max(ranked[1]["price"], BID_FLOOR) + 0.01)
         if len(ranked) > 1
-        else BID_FLOOR
+        else BID_FLOOR + 0.01
     )
     logger.info(
         "Auction pricing: candidates=%s winner_price=%.4f "
